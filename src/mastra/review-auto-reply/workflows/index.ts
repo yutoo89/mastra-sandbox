@@ -29,17 +29,31 @@ const extractionSchema = z.object({
   paragraph: z.string().nullable().describe('段落構成'),
   phrases: z.string().nullable().describe('必須句'),
   signature: z.string().nullable().describe('署名'),
-  emojis: z.string().nullable().describe('絵文字・記号'),
+  emojis: z.array(z.string()).nullable().describe('絵文字・記号'),
   cta: z.string().nullable().describe('CTA'),
 });
 
 const extractionInstructions = `
-あなたは日本語の口コミ返信分析エキスパートです。与えられた口コミデータから、返信に共通する特徴を抽出し、JSON で出力してください。JSON スキーマ: ${extractionSchema.toString()}
+あなたは日本語の口コミ返信スタイルガイド抽出エキスパートです。
+
+背景:
+- ホテルや飲食店のレビューに対する返信文を分析し、企業や店舗ごとの一貫したスタイルガイドを作成します。
+
+期待する抽出内容:
+- 口調・敬語レベル（丁寧語／謙譲語など）
+- 一人称・代名詞（「私たち」「当店」「弊ホテル」など）
+- 文長・総語数（例: 100–150 語／320–450 字など）
+- 段落構成（例: 感謝→ポジ要素→謝辞→改善策→再訪招待）
+- 必須フレーズ（「ご来店ありがとうございます」「またのご利用を…」など）
+- 署名形式（「店長 田中」「Guest Relations Manager」など）
+- 絵文字・記号（複数可、配列で返却。頻度や種類）
+- CTA（電話番号・メールへの誘導文など）
 
 制約:
-- 入力は最大 25 件。
-- 出力は日本語で、各フィールドは null 許可。
-- 値は配列ではなく単一文字列として要約しないこと (後続で集約)。
+- 入力は最大 25 件
+- 出力は JSON で、スキーマ: ${extractionSchema}
+- 各フィールドが見られない場合は null を返してください
+- 出力は日本語で
 `;
 
 /* --------------------------------------------------------------------------
@@ -149,7 +163,7 @@ const processReviews = new Step({
       paragraph: z.array(z.string().nullable()),
       phrases: z.array(z.string().nullable()),
       signature: z.array(z.string().nullable()),
-      emojis: z.array(z.string().nullable()),
+      emojis: z.array(z.array(z.string()).nullable()),
       cta: z.array(z.string().nullable()),
     }),
   }),
@@ -163,14 +177,13 @@ const processReviews = new Step({
       paragraph: [] as (string | null)[],
       phrases: [] as (string | null)[],
       signature: [] as (string | null)[],
-      emojis: [] as (string | null)[],
+      emojis: [] as (string[] | null)[],
       cta: [] as (string | null)[],
     };
 
     for (let i = 0; i < reviews.length; i += 25) {
       const batch = reviews.slice(i, i + 25);
-      const prompt = `以下の口コミ (length: ${batch.length}) から、このブランドの返信文の特徴を抽出してください。\n\n${JSON.stringify(batch, null, 2)}`;
-
+      const prompt = `以下の口コミ ${batch.length} 件から、このブランドの返信文の特徴を抽出してください。\n\n${JSON.stringify(batch, null, 2)}`;
       try {
         // Agent 呼び出しとパースをそれぞれキャッチ
         const response = await extractionAgent.generate(
@@ -206,7 +219,19 @@ const processReviews = new Step({
 const summarizerAgent = new Agent({
   name: 'Reply Feature Summarizer',
   model: llm,
-  instructions: `以下の配列から共通する特徴を抽出し、単一の簡潔な日本語文字列にまとめてください。`,
+  instructions: `
+あなたはスタイルガイド生成エキスパートです。
+
+背景:
+- 前段階で抽出された複数の特徴の配列があります。
+
+役割:
+- 各フィールドの配列から、最も共通し頻出する要素を優先的に抽出してください。
+- 抽出が困難な場合や要素が見られない場合は null を返してください。
+
+出力:
+- JSON で、スキーマ: ${extractionSchema}
+`,
 });
 
 const summarizeAggregates = new Step({
@@ -215,8 +240,7 @@ const summarizeAggregates = new Step({
   outputSchema: extractionSchema,
   execute: async ({ context }) => {
     const { aggregated } = context.getStepResult(processReviews);
-
-    const prompt = `以下の配列から共通する特徴を抽出し、単一の簡潔な日本語文字列にまとめてください。\n\n${JSON.stringify(aggregated, null, 2)}`;
+    const prompt = `以下の aggregated 特徴配列から、共通部分を優先して抽出し、単一の簡潔な日本語文字列としてまとめてください。\n\n${JSON.stringify(aggregated, null, 2)}`;
     const response = await summarizerAgent.generate(
       [{ role: 'user', content: prompt }],
       {
