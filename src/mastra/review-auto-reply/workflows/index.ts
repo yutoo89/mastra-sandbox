@@ -23,15 +23,24 @@ type Review = z.infer<typeof reviewSchema>;
 
 /** 抽出対象フィールドの共通スキーマ (Agent 出力) */
 const extractionSchema = z.object({
-  tone: z.string().nullable(), // 口調・敬語レベル
-  pronoun: z.string().nullable(), // 一人称・代名詞
-  length: z.string().nullable(), // 文長・総語数
-  paragraph: z.string().nullable(), // 段落構成
-  phrases: z.string().nullable(), // 必須句
-  signature: z.string().nullable(), // 署名
-  emojis: z.string().nullable(), // 絵文字・記号
-  cta: z.string().nullable(), // CTA
+  tone: z.string().nullable().describe('口調・敬語レベル'),
+  pronoun: z.string().nullable().describe('一人称・代名詞'),
+  length: z.string().nullable().describe('文長・総語数'),
+  paragraph: z.string().nullable().describe('段落構成'),
+  phrases: z.string().nullable().describe('必須句'),
+  signature: z.string().nullable().describe('署名'),
+  emojis: z.string().nullable().describe('絵文字・記号'),
+  cta: z.string().nullable().describe('CTA'),
 });
+
+const extractionInstructions = `
+あなたは日本語の口コミ返信分析エキスパートです。与えられた口コミデータから、返信に共通する特徴を抽出し、JSON で出力してください。JSON スキーマ: ${extractionSchema.toString()}
+
+制約:
+- 入力は最大 25 件。
+- 出力は日本語で、各フィールドは null 許可。
+- 値は配列ではなく単一文字列として要約しないこと (後続で集約)。
+`;
 
 /* --------------------------------------------------------------------------
  * 2. CSV → JSON 変換 Step
@@ -41,7 +50,7 @@ const parseReviews = new Step({
   description: 'CSV を読み込み、必要カラムのみを抽出して JSON 配列を返す',
   outputSchema: z.object({ reviews: z.array(reviewSchema) }),
   execute: async ({ context }) => {
-    const csvPath = context.triggerData?.csvPath || '../../../../data/csv/AI返信検証用データ - オリエンタルホテル 京都六条.csv';
+    const csvPath = context.triggerData?.csvPath;
     
     try {
       // ファイルが存在するか確認
@@ -112,7 +121,10 @@ const computeReplyStats = new Step({
       .sort((a, b) => b[1] - a[1])
       .slice(0, 10)
       .map(([emoji]) => emoji);
-
+    
+    console.log('medianReplyLength', medianReplyLength);
+    console.log('medianEmojiCount', medianEmojiCount);
+    console.log('commonEmojis', commonEmojis);
     return { medianReplyLength, medianEmojiCount, commonEmojis };
   },
 });
@@ -123,7 +135,7 @@ const computeReplyStats = new Step({
 const extractionAgent = new Agent({
   name: 'Reply Feature Extraction Agent',
   model: llm,
-  instructions: `あなたは日本語の口コミ返信分析エキスパートです。与えられた口コミデータから、返信に共通する特徴を抽出し、JSON で出力してください。JSON スキーマ: ${extractionSchema.toString()}\n\n制約:\n- 入力は最大 25 件。\n- 出力は日本語で、各フィールドは null 許可。\n- 値は配列ではなく単一文字列として要約しないこと (後続で集約)。\n`,
+  instructions: extractionInstructions,
 });
 
 const processReviews = new Step({
@@ -157,27 +169,33 @@ const processReviews = new Step({
 
     for (let i = 0; i < reviews.length; i += 25) {
       const batch = reviews.slice(i, i + 25);
-      const prompt = `以下の口コミ JSON 配列 (length: ${batch.length}) から、返信の特徴を抽出してください。\n\n${JSON.stringify(batch, null, 2)}`;
+      const prompt = `以下の口コミ (length: ${batch.length}) から、このブランドの返信文の特徴を抽出してください。\n\n${JSON.stringify(batch, null, 2)}`;
 
-      const response = await extractionAgent.generate([{ role: 'user', content: prompt }]);
+      try {
+        // Agent 呼び出しとパースをそれぞれキャッチ
+        const response = await extractionAgent.generate(
+          [{ role: 'user', content: prompt }],
+          {
+            output: extractionSchema,
+          }
+        );
+        const data = response.object;
 
-      const parsed = extractionSchema.safeParse(JSON.parse(response.text));
-      if (!parsed.success) {
-        console.warn(`Batch ${i / 25} parse failed`);
+        aggregated.tone.push(data.tone);
+        aggregated.pronoun.push(data.pronoun);
+        aggregated.length.push(data.length);
+        aggregated.paragraph.push(data.paragraph);
+        aggregated.phrases.push(data.phrases);
+        aggregated.signature.push(data.signature);
+        aggregated.emojis.push(data.emojis);
+        aggregated.cta.push(data.cta);
+      } catch (agentError) {
+        console.log(`Error processing batch ${i / 25}:`, agentError);
         continue;
       }
-
-      const data = parsed.data;
-      aggregated.tone.push(data.tone);
-      aggregated.pronoun.push(data.pronoun);
-      aggregated.length.push(data.length);
-      aggregated.paragraph.push(data.paragraph);
-      aggregated.phrases.push(data.phrases);
-      aggregated.signature.push(data.signature);
-      aggregated.emojis.push(data.emojis);
-      aggregated.cta.push(data.cta);
     }
 
+    console.log('aggregated', aggregated);
     return { aggregated };
   },
 });
@@ -194,20 +212,20 @@ const summarizerAgent = new Agent({
 const summarizeAggregates = new Step({
   id: 'summarize-aggregates',
   description: '配列を単一文字列に要約',
-  outputSchema: z.record(z.string(), z.string()),
+  outputSchema: extractionSchema,
   execute: async ({ context }) => {
     const { aggregated } = context.getStepResult(processReviews);
 
-    const summary: Record<string, string> = {};
+    const prompt = `以下の配列から共通する特徴を抽出し、単一の簡潔な日本語文字列にまとめてください。\n\n${JSON.stringify(aggregated, null, 2)}`;
+    const response = await summarizerAgent.generate(
+      [{ role: 'user', content: prompt }],
+      {
+        output: extractionSchema,
+      }
+    );
 
-    for (const [key, arr] of Object.entries(aggregated)) {
-      const joined = arr.filter(Boolean).join('\n');
-      const prompt = `${key} の配列:\n${joined}\n\n共通項を 1–2 文で要約してください。`;
-      const resp = await summarizerAgent.generate([{ role: 'user', content: prompt }]);
-      summary[key] = resp.text.trim();
-    }
-
-    return summary;
+    console.log('summary', response.object);
+    return response.object;
   },
 });
 
@@ -226,10 +244,15 @@ const saveGuidelines = new Step({
       reply_guidelines: summary,
     };
 
-    await fs.mkdir('output', { recursive: true });
-    await fs.writeFile('output/reply_guidelines.json', JSON.stringify(outObject, null, 2), 'utf-8');
+    try {
+      await fs.mkdir('data/output', { recursive: true });
+      await fs.writeFile('data/output/reply_guidelines.json', JSON.stringify(outObject, null, 2), 'utf-8');
+    } catch (error) {
+      console.error('ファイル保存エラー:', error);
+      throw error;
+    }
 
-    return { savedPath: 'output/reply_guidelines.json' };
+    return { savedPath: 'data/output/reply_guidelines.json' };
   },
 });
 
