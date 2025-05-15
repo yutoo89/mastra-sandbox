@@ -20,6 +20,7 @@
     "@mastra/core": "^0.9.4-alpha.4",
     "@mastra/libsql": "^0.0.4-alpha.4",
     "@mastra/memory": "^0.3.4-alpha.4",
+    "csvtojson": "^2.0.10",
     "zod": "^3.24.4"
   },
   "devDependencies": {
