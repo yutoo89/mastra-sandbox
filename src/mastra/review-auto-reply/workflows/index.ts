@@ -118,6 +118,7 @@ const summarizerInstructions = `
 - 誰が読んでも解釈にばらつきがない具体的な表現を使用
 - 出力はmarkdown形式の日本語
 - 一般的なベストプラクティスではなくブランド独自のトーンを表現する
+- 文字数の目安と絵文字使用可否、よく使用される絵文字を必ず含める
 `;
 
 /* --------------------------------------------------------------------------
@@ -297,7 +298,31 @@ const generateStyleGuide = new Step({
   execute: async ({ context }) => {
     const { aggregated } = context.getStepResult(processReviews);
     const stats = context.getStepResult(computeReplyStats);
-    const prompt = `抽出結果と統計情報で完全なスタイルガイドをマークダウンで作成してください。\n抽出結果: ${JSON.stringify(aggregated)}\n統計情報: ${JSON.stringify(stats)}`;
+    // 統計情報のフィールド説明マッピング
+    const statLabels: Record<string, string> = {
+      medianReplyLength: '1返信あたりの文字数の中央値',
+      standardDeviationReplyLength: '1返信あたりの文字数の標準偏差',
+      medianEmojiCount: '1返信あたりの絵文字数の中央値',
+      standardDeviationEmojiCount: '1返信あたりの絵文字数の標準偏差',
+      frequentlyUsedEmojis: '5%以上の返信で使用された絵文字',
+      replyLengthConfidenceInterval: '返信文字数の中央値±標準偏差の範囲',
+      emojiCountConfidenceInterval: '絵文字数の中央値±標準偏差の範囲',
+      emojiUsageRate: '絵文字使用率 (%)',
+    };
+    // stats を説明付き文字列に整形
+    const statsInfo = Object.entries(stats)
+      .map(([key, value]) => {
+        const label = statLabels[key] || key;
+        const valStr = Array.isArray(value) ? value.join('〜') : value;
+        return `- ${label}: ${valStr}`;
+      })
+      .join('\n');
+
+    const prompt = `以下の統計情報とスタイルガイドを基に、ブランド独自のレビュー返信スタイルガイドをMarkdown形式で作成してください。\n` +
+                   `## 統計情報:\n${statsInfo}\n` +
+                   `## スタイルガイド:\n${JSON.stringify(aggregated, null, 2)}`;
+
+    console.log('prompt', prompt);
     const response = await summarizerAgent.generate(
       [{ role: 'user', content: prompt }],
       { output: z.object({ styleGuide: z.string() }) }
