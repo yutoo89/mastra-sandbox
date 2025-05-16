@@ -10,6 +10,7 @@ import * as fs from 'fs/promises';
  * 1. 共有リソース
  * -----------------------------------------------------------------------*/
 const llm = openai('gpt-4o');
+// const llm = openai('o3-mini');
 
 /** Review レコード */
 const reviewSchema = z.object({
@@ -26,7 +27,7 @@ const extractionSchema = z.object({
   tone: z.string().nullable().describe('口調・敬語レベル'),
   pronoun: z.string().nullable().describe('一人称・代名詞'),
   paragraph: z.string().nullable().describe('段落構成'),
-  phrases: z.array(z.string()).describe('頻出フレーズ'),
+  phrases: z.string().nullable().describe('頻出フレーズ'),
   signature: z.string().nullable().describe('署名'),
   cta: z.string().nullable().describe('CTA'),
 });
@@ -44,26 +45,79 @@ const styleGuideSchema = extractionSchema.extend({
 });
 
 const extractionInstructions = `
-あなたはレビュー返信スタイルガイド作成のエキスパートです。
+あなたはレビュー返信スタイルガイド作成のエキスパートLLMです。
 
-レビューに対する過去の返信文が提供されます。
-返信文に共通して見られる口調や構成などの特徴を抽出し、ブランドトーンを表現するためのスタイルガイドを作成してください。
+以下の「過去の返信文リスト」を入力として受け取り、ブランドトーンを表現するためのスタイルガイドを作成してください。誰が見ても解釈にばらつきがないよう、具体的な要素や検討事項、出力フォーマット例、NG例／OK例まで含めて説明的にまとめてください。
 
-項目:
-- 口調・敬語レベル
-- 一人称・代名詞
-- 段落構成
-  - 「感謝→ポジ要素→謝辞→改善策→再訪招待」など
-- 頻出フレーズ
-  - 「ご来店ありがとうございます」「またのご利用を…」など
-- 署名形式
-- CTA
-  - 電話番号・メールへの誘導文など
+【出力フォーマット】
+各項目ごとに、
+  1. 概要説明（1～2文）
+  2. 検討すべき要素リスト（箇条書き）
+  3. 推奨ルール・基準（具体的に）
+  4. OK例／NG例（実際の返信文の短文例）
 
-制約:
-- 返信文によってばらつきが大きい項目は'null'を返す
-- 誰が読んでも解釈にばらつきがないように具体的なスタイルを定義する
-- 各項目は日本語で返す
+――――――――
+■ 項目
+
+1. 口調・敬語レベル  
+   - 概要説明：文章全体の丁寧さやフォーマル度を定義する  
+   - 検討すべき要素：  
+     - 文末表現（です・ます調 vs. だ・である調）  
+     - 敬語の種類（尊敬語／謙譲語／丁寧語）  
+     - 過度な敬語／二重敬語の回避  
+     - 文章のリズム感（短文／長文のバランス）  
+
+2. 一人称・代名詞  
+   - 概要説明：自社や相手を指すときの呼称を統一し、親しみやすさと礼節を両立する  
+   - 検討すべき要素：  
+     - 一人称（弊社／当店／自社）の使い分け  
+     - 二人称（お客様／お客さま／お得意様）の敬称レベル  
+     - 三人称（他のお客さま／スタッフ）の言及の可否
+
+3. 段落構成  
+   - 概要説明：返信文の骨組みとなる段落構成パターンを定義する  
+   - 検討すべき要素：
+     - 各段落の長さ（文字数の目安）  
+     - 接続詞や改行位置の使い方  
+
+4. 頻出フレーズ  
+   - 概要説明：ブランドらしさを担保する定型文・口ぐせ表現を単一文字列でまとめる  
+   - 検討すべき要素：  
+     - 感謝表現（「ご来店ありがとうございます」「ご利用誠にありがとうございます」など）  
+     - 再訪促進（「またのご来店をお待ちしております」「次回もぜひ…」など）  
+     - 謝罪表現（「ご不便をおかけし申し訳ございません」「深くお詫び申し上げます」など）
+
+5. 署名形式  
+   - 概要説明：返信の最後に入れる署名（担当者名・部署名・連絡先）のフォーマットを統一  
+   - 検討すべき要素：  
+     - 名乗り方（フルネーム vs イニシャル）  
+     - 部署表記（例：「カスタマーサポート」）  
+     - 連絡先の有無・形式（電話番号・メールアドレス）  
+
+6. CTA（Call To Action）  
+   - 概要説明：次のアクションを促す文言の形式とタイミング  
+   - 検討すべき要素：  
+     - 電話／メール誘導の表現  
+     - Web予約ページへのリンク案内  
+     - キャンペーン告知の有無  
+
+――――――――  
+■ 制約  
+- 返信文によってばらつきが大きい項目は \`null\` を返す  
+- 誰が読んでも解釈にばらつきがない具体的な表現を使用
+- 出力はmarkdown形式の日本語
+- 一般的なベストプラクティスではなくブランド独自のトーンを表現する
+`;
+
+const summarizerInstructions = `
+あなたはレビュー返信スタイルガイド作成のエキスパートLLMです。
+各担当者が作成した返信スタイルガイドが提供されます。それらを統合した最終的なスタイルガイドをmarkdown形式で出力してください。
+
+## 条件
+
+- 誰が読んでも解釈にばらつきがない具体的な表現を使用
+- 出力はmarkdown形式の日本語
+- 一般的なベストプラクティスではなくブランド独自のトーンを表現する
 `;
 
 /* --------------------------------------------------------------------------
@@ -192,7 +246,6 @@ const computeReplyStats = new Step({
   },
 });
 
-
 /* --------------------------------------------------------------------------
  * 4. 口コミ 25 件ずつ Agent 抽出 Step
  * -----------------------------------------------------------------------*/
@@ -204,23 +257,11 @@ const extractionAgent = new Agent({
 
 const processReviews = new Step({
   id: 'process-reviews',
-  description: '25 件ずつ口コミを処理し、各フィールド値を配列化',
-  outputSchema: z.object({
-    aggregated: z.object({
-      tone: z.array(z.string().nullable()),
-      pronoun: z.array(z.string().nullable()),
-      paragraph: z.array(z.string().nullable()),
-      phrases: z.array(z.array(z.string())).nullable(),
-      signature: z.array(z.string().nullable()),
-      emojis: z.array(z.array(z.string()).nullable()),
-      cta: z.array(z.string().nullable()),
-    }),
-  }),
+  description: '25 件ずつ口コミを処理し、抽出結果をオブジェクトの配列として返す',
+  outputSchema: z.object({ aggregated: z.array(extractionSchema) }),
   execute: async ({ context }) => {
     const { reviews } = context.getStepResult(parseReviews);
-    const aggregated: any = {
-      tone: [], pronoun: [], paragraph: [], phrases: [], signature: [], emojis: [], cta: [],
-    };
+    const aggregated: z.infer<typeof extractionSchema>[] = [];
 
     for (let i = 0; i < reviews.length; i += 25) {
       const batch = reviews.slice(i, i + 25);
@@ -230,13 +271,7 @@ const processReviews = new Step({
           [{ role: 'user', content: prompt }],
           { output: extractionSchema }
         );
-        const data = response.object;
-        aggregated.tone.push(data.tone);
-        aggregated.pronoun.push(data.pronoun);
-        aggregated.paragraph.push(data.paragraph);
-        aggregated.phrases.push(data.phrases);
-        aggregated.signature.push(data.signature);
-        aggregated.cta.push(data.cta);
+        aggregated.push(response.object);
       } catch (e) {
         console.warn(`Batch ${i/25} error:`, e);
       }
@@ -248,114 +283,32 @@ const processReviews = new Step({
 });
 
 /* --------------------------------------------------------------------------
- * 5. 共通特徴の要約 Step
+ * 5. スタイルガイド生成 Step
  * -----------------------------------------------------------------------*/
 const summarizerAgent = new Agent({
   name: 'Reply Feature Summarizer',
   model: llm,
-  instructions: `
-あなたはレビュー返信スタイルガイド作成のエキスパートです。
-
-レビュー返信を通じてブランドトーンを表現するためのスタイルガイドを作成してください。
-複数の返信担当者が定義したスタイルガイドが提供されます。それらを統合・整理して完全なスタイルガイドを作成してください。
-
-項目:
-- 口調・敬語レベル
-- 一人称・代名詞
-- 段落構成
-  - 「感謝→ポジ要素→謝辞→改善策→再訪招待」など
-- 頻出フレーズ
-  - 「ご来店ありがとうございます」「またのご利用を…」など
-- 署名形式
-- CTA
-  - 電話番号・メールへの誘導文など
-
-制約:
-- 担当者ごとに異なるスタイルを定義している場合は多いものを採用する
-- 重複するスタイルは統合する
-- 誰が読んでも解釈にばらつきがないように具体的なスタイルを定義する
-- 各項目は日本語で返す
-`,
+  instructions: summarizerInstructions,
 });
-
-const summarizeAggregates = new Step({
-  id: 'summarize-aggregates',
-  description: '配列を単一ガイドに要約',
-  outputSchema: extractionSchema,
+const generateStyleGuide = new Step({
+  id: 'generate-style-guide',
+  description: '抽出結果と統計情報からマークダウン形式のスタイルガイドを生成',
+  outputSchema: z.object({ styleGuide: z.string() }),
   execute: async ({ context }) => {
     const { aggregated } = context.getStepResult(processReviews);
-    const prompt = `以下の抽出結果をもとに、ブランドトーンを表現するスタイルガイドを具体的にまとめてください。\n\n${JSON.stringify(aggregated, null, 2)}`;
-    try {
-      const response = await summarizerAgent.generate(
-      [{ role: 'user', content: prompt }],
-      { output: extractionSchema }
-      );
-      console.log('summarizeAggregates', response.object);
-      return response.object;
-    } catch (e) {
-      console.error('summarizeAggregates error', e);
-      throw e;
-    }
-  },
-});
-
-/* --------------------------------------------------------------------------
- * 6. スタイルガイド出力 Step
- * -----------------------------------------------------------------------*/
-const outputStyleGuide = new Step({
-  id: 'output-style-guide',
-  description: '要約結果と統計情報をコンソールログ出力',
-  outputSchema: styleGuideSchema,
-  execute: async ({ context }) => {
-    const summary = context.getStepResult(summarizeAggregates);
     const stats = context.getStepResult(computeReplyStats);
-
-    const labels: Record<string, string> = {
-      tone: '口調・敬語レベル',
-      pronoun: '一人称・代名詞',
-      paragraph: '段落構成',
-      phrases: '頻出フレーズ',
-      signature: '署名形式',
-      cta: 'CTA',
-      frequentlyUsedEmojis: '頻出絵文字',
-      replyLengthConfidenceInterval: '返信文字数',
-    };
-
-    const lines: string[] = [];
-    Object.entries(summary).forEach(([key, value]) => {
-      if (value == null) return;
-      const label = labels[key] || key;
-      if (key === 'phrases' && Array.isArray(value) && value.length) {
-        lines.push(`- ${label}:`);
-        value.forEach(phrase => lines.push(`  - \`${phrase}\``));
-      } else if (Array.isArray(value)) {
-        lines.push(`- ${label}: ${value.join('、')}`);
-      } else if (typeof value === 'string') {
-        lines.push(`- ${label}: ${value}`);
-      }
-    });
-    if (stats.frequentlyUsedEmojis.length) {
-      lines.push(`- ${labels.frequentlyUsedEmojis}: ${stats.frequentlyUsedEmojis.join('、')}`);
-    }
-    const [rMin, rMax] = stats.replyLengthConfidenceInterval;
-    if (!(rMin === 0 && rMax === 0)) {
-      lines.push(`- ${labels.replyLengthConfidenceInterval}: ${Math.round(rMin)}文字〜${Math.round(rMax)}文字`);
-    }
-    // emojiUsageRateが0の場合は`- 絵文字: 使用しない`と表示
-    if (stats.emojiUsageRate === 0) {
-      lines.push(`- 絵文字: 使用しない`);
-    } else {
-      lines.push(`- 絵文字使用頻度: ${stats.emojiUsageRate}% ※ 1回以上絵文字が使用された返信の割合`);
-    }
-
-    console.log('=== スタイルガイド ===');
-    lines.forEach(line => console.log(line));
-    return { ...summary, ...stats };
+    const prompt = `抽出結果と統計情報で完全なスタイルガイドをマークダウンで作成してください。\n抽出結果: ${JSON.stringify(aggregated)}\n統計情報: ${JSON.stringify(stats)}`;
+    const response = await summarizerAgent.generate(
+      [{ role: 'user', content: prompt }],
+      { output: z.object({ styleGuide: z.string() }) }
+    );
+    console.log(response.object.styleGuide);
+    return response.object;
   },
 });
 
 /* --------------------------------------------------------------------------
- * 7. Workflow 定義
+ * 6. Workflow 定義
  * -----------------------------------------------------------------------*/
 const reviewAutoReplyWorkflow = new Workflow({
   name: 'review-auto-reply-workflow',
@@ -364,8 +317,7 @@ const reviewAutoReplyWorkflow = new Workflow({
   .step(parseReviews)
   .then(computeReplyStats)
   .then(processReviews)
-  .then(summarizeAggregates)
-  .then(outputStyleGuide);
+  .then(generateStyleGuide);
 
 reviewAutoReplyWorkflow.commit();
 
