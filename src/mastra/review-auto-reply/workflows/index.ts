@@ -3,12 +3,13 @@ import { Agent } from '@mastra/core/agent';
 import { Step, Workflow } from '@mastra/core/workflows';
 import { z } from 'zod';
 import Converter from 'csvtojson';
+import emojiRegex from 'emoji-regex';
 import * as fs from 'fs/promises';
 
 /* --------------------------------------------------------------------------
  * 1. 共有リソース
  * -----------------------------------------------------------------------*/
-const llm = openai('gpt-4o-mini');
+const llm = openai('gpt-4o');
 
 /** Review レコード */
 const reviewSchema = z.object({
@@ -18,42 +19,51 @@ const reviewSchema = z.object({
   review_comment: z.string().nullable(),
   reply: z.string().nullable(),
 });
-
 type Review = z.infer<typeof reviewSchema>;
 
 /** 抽出対象フィールドの共通スキーマ (Agent 出力) */
 const extractionSchema = z.object({
   tone: z.string().nullable().describe('口調・敬語レベル'),
   pronoun: z.string().nullable().describe('一人称・代名詞'),
-  length: z.string().nullable().describe('文長・総語数'),
   paragraph: z.string().nullable().describe('段落構成'),
-  phrases: z.string().nullable().describe('必須句'),
+  phrases: z.array(z.string()).describe('頻出フレーズ'),
   signature: z.string().nullable().describe('署名'),
-  emojis: z.array(z.string()).nullable().describe('絵文字・記号'),
   cta: z.string().nullable().describe('CTA'),
 });
 
+// extractionSchemaに統計情報を追加したスタイルガイドスキーマ
+const styleGuideSchema = extractionSchema.extend({
+  medianReplyLength: z.number().nullable().describe('1返信あたりの文字数の中央値'),
+  standardDeviationReplyLength: z.number().nullable().describe('1返信あたりの文字数の標準偏差'),
+  medianEmojiCount: z.number().nullable().describe('1返信あたりの絵文字数の中央値'),
+  standardDeviationEmojiCount: z.number().nullable().describe('1返信あたりの絵文字数の標準偏差'),
+  frequentlyUsedEmojis: z.array(z.string()).nullable().describe('5%以上の返信で使用された絵文字'),
+  replyLengthConfidenceInterval: z.tuple([z.number(), z.number()]).nullable().describe('返信文字数の中央値±標準偏差の範囲'),
+  emojiCountConfidenceInterval: z.tuple([z.number(), z.number()]).nullable().describe('絵文字数の中央値±標準偏差の範囲'),
+  emojiUsageRate: z.number().nullable().describe('絵文字使用率 (%)'),
+});
+
 const extractionInstructions = `
-あなたは日本語の口コミ返信スタイルガイド抽出エキスパートです。
+あなたはレビュー返信スタイルガイド作成のエキスパートです。
 
-背景:
-- ホテルや飲食店のレビューに対する返信文を分析し、企業や店舗ごとの一貫したスタイルガイドを作成します。
+レビューに対する過去の返信文が提供されます。
+返信文に共通して見られる口調や構成などの特徴を抽出し、ブランドトーンを表現するためのスタイルガイドを作成してください。
 
-期待する抽出内容:
-- 口調・敬語レベル（丁寧語／謙譲語など）
-- 一人称・代名詞（「私たち」「当店」「弊ホテル」など）
-- 文長・総語数（例: 100–150 語／320–450 字など）
-- 段落構成（例: 感謝→ポジ要素→謝辞→改善策→再訪招待）
-- 必須フレーズ（「ご来店ありがとうございます」「またのご利用を…」など）
-- 署名形式（「店長 田中」「Guest Relations Manager」など）
-- 絵文字・記号（複数可、配列で返却。頻度や種類）
-- CTA（電話番号・メールへの誘導文など）
+項目:
+- 口調・敬語レベル
+- 一人称・代名詞
+- 段落構成
+  - 「感謝→ポジ要素→謝辞→改善策→再訪招待」など
+- 頻出フレーズ
+  - 「ご来店ありがとうございます」「またのご利用を…」など
+- 署名形式
+- CTA
+  - 電話番号・メールへの誘導文など
 
 制約:
-- 入力は最大 25 件
-- 出力は JSON で、スキーマ: ${extractionSchema}
-- 各フィールドが見られない場合は null を返してください
-- 出力は日本語で
+- 返信文によってばらつきが大きい項目は'null'を返す
+- 誰が読んでも解釈にばらつきがないように具体的なスタイルを定義する
+- 各項目は日本語で返す
 `;
 
 /* --------------------------------------------------------------------------
@@ -65,12 +75,9 @@ const parseReviews = new Step({
   outputSchema: z.object({ reviews: z.array(reviewSchema) }),
   execute: async ({ context }) => {
     const csvPath = context.triggerData?.csvPath;
-    
     try {
-      // ファイルが存在するか確認
-      await fs.access(csvPath);
-      const raw = await Converter({ flatKeys: true }).fromFile(csvPath);
-
+      await fs.access(csvPath!);
+      const raw = await Converter({ flatKeys: true }).fromFile(csvPath!);
       const reviews: Review[] = raw.map((r: any) => ({
         brand_name: r.brand_name ?? null,
         store_name: r.store_name ?? null,
@@ -78,11 +85,10 @@ const parseReviews = new Step({
         review_comment: r.review_comment ?? null,
         reply: r.reply ?? null,
       }));
-
       return { reviews };
     } catch (error: unknown) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      throw new Error(`CSVファイルが存在しません: ${csvPath} - ${errorMessage}`);
+      const msg = error instanceof Error ? error.message : String(error);
+      throw new Error(`CSVファイルが存在しません: ${csvPath} - ${msg}`);
     }
   },
 });
@@ -92,35 +98,47 @@ const parseReviews = new Step({
  * -----------------------------------------------------------------------*/
 const computeReplyStats = new Step({
   id: 'compute-reply-stats',
-  description: 'reply 文字数中央値・絵文字中央値・頻出絵文字を計算',
+  description: 'reply の統計情報（中央値・標準偏差・頻出絵文字・絵文字使用率）を計算',
   outputSchema: z.object({
     medianReplyLength: z.number(),
+    standardDeviationReplyLength: z.number(),
     medianEmojiCount: z.number(),
-    commonEmojis: z.array(z.string()),
+    standardDeviationEmojiCount: z.number(),
+    frequentlyUsedEmojis: z.array(z.string()),
+    replyLengthConfidenceInterval: z.tuple([z.number(), z.number()]),
+    emojiCountConfidenceInterval: z.tuple([z.number(), z.number()]),
+    emojiUsageRate: z.number(),
   }),
   execute: async ({ context }) => {
     const { reviews } = context.getStepResult(parseReviews);
-
-    const emojiRegex = /[\p{Extended_Pictographic}]/gu;
+    // emoji-regex を使用して絵文字を正確にマッチ
+    const emojiPattern = emojiRegex();
 
     const lengths: number[] = [];
-    const emojiCounts: Map<string, number> = new Map();
-    const perReplyEmojiCnt: number[] = [];
+    const emojiCounts: number[] = [];
+    const emojiReplyMap: Map<string, Set<number>> = new Map();
 
-    for (const { reply } of reviews) {
-      if (!reply) continue;
-      lengths.push(reply.length);
+    reviews.forEach(({ reply }, idx) => {
+      if (!reply) return;
+      // 文字単位で長さを計算
+      const charCount = Array.from(reply).length;
+      lengths.push(charCount);
 
-      const emojis = reply.match(emojiRegex) ?? [];
-      perReplyEmojiCnt.push(emojis.length);
+      // 絵文字抽出
+      const matches = [...reply.matchAll(emojiPattern)];
+      const emojis = matches.map(m => m[0]);
+      emojiCounts.push(emojis.length);
 
-      for (const e of emojis) {
-        emojiCounts.set(e, (emojiCounts.get(e) ?? 0) + 1);
-      }
-    }
+      // 各絵文字が登場した返信インデックスを記録
+      new Set(emojis).forEach(e => {
+        if (!emojiReplyMap.has(e)) emojiReplyMap.set(e, new Set());
+        emojiReplyMap.get(e)!.add(idx);
+      });
+    });
 
-    const median = (arr: number[]) => {
-      if (arr.length === 0) return 0;
+    // 中央値計算
+    const median = (arr: number[]): number => {
+      if (!arr.length) return 0;
       const sorted = [...arr].sort((a, b) => a - b);
       const mid = Math.floor(sorted.length / 2);
       return sorted.length % 2 === 0
@@ -128,20 +146,52 @@ const computeReplyStats = new Step({
         : sorted[mid];
     };
 
-    const medianReplyLength = median(lengths);
-    const medianEmojiCount = median(perReplyEmojiCnt);
+    // 標準偏差計算
+    const stdDev = (arr: number[]): number => {
+      if (!arr.length) return 0;
+      const mean = arr.reduce((sum, x) => sum + x, 0) / arr.length;
+      const variance = arr.reduce((sum, x) => sum + (x - mean) ** 2, 0) / arr.length;
+      return Math.sqrt(variance);
+    };
 
-    const commonEmojis = [...emojiCounts.entries()]
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 10)
+    const medianReplyLength = median(lengths);
+    const standardDeviationReplyLength = stdDev(lengths);
+    const medianEmojiCount = median(emojiCounts);
+    const standardDeviationEmojiCount = stdDev(emojiCounts);
+
+    // 5%以上の返信で使われた絵文字を抽出
+    const totalReplies = reviews.filter(r => r.reply).length;
+    const repliesWithEmoji = reviews.filter(r => r.reply && [...r.reply.matchAll(emojiPattern)].length > 0).length;
+    const emojiUsageRate = totalReplies > 0 ? (repliesWithEmoji / totalReplies) * 100 : 0;
+
+    const frequentlyUsedEmojis = [...emojiReplyMap.entries()]
+      .filter(([, idxSet]) => idxSet.size / (totalReplies || 1) >= 0.05)
       .map(([emoji]) => emoji);
-    
-    console.log('medianReplyLength', medianReplyLength);
-    console.log('medianEmojiCount', medianEmojiCount);
-    console.log('commonEmojis', commonEmojis);
-    return { medianReplyLength, medianEmojiCount, commonEmojis };
+
+    const replyCI: [number, number] = [
+      Math.max(0, medianReplyLength - standardDeviationReplyLength),
+      medianReplyLength + standardDeviationReplyLength,
+    ];
+    const emojiCI: [number, number] = [
+      Math.max(0, medianEmojiCount - standardDeviationEmojiCount),
+      medianEmojiCount + standardDeviationEmojiCount,
+    ];
+
+    const result = {
+      medianReplyLength,
+      standardDeviationReplyLength,
+      medianEmojiCount,
+      standardDeviationEmojiCount,
+      frequentlyUsedEmojis,
+      replyLengthConfidenceInterval: replyCI,
+      emojiCountConfidenceInterval: emojiCI,
+      emojiUsageRate,
+    };
+    console.log('computeReplyStats', result);
+    return result;
   },
 });
+
 
 /* --------------------------------------------------------------------------
  * 4. 口コミ 25 件ずつ Agent 抽出 Step
@@ -159,9 +209,8 @@ const processReviews = new Step({
     aggregated: z.object({
       tone: z.array(z.string().nullable()),
       pronoun: z.array(z.string().nullable()),
-      length: z.array(z.string().nullable()),
       paragraph: z.array(z.string().nullable()),
-      phrases: z.array(z.string().nullable()),
+      phrases: z.array(z.array(z.string())).nullable(),
       signature: z.array(z.string().nullable()),
       emojis: z.array(z.array(z.string()).nullable()),
       cta: z.array(z.string().nullable()),
@@ -169,42 +218,27 @@ const processReviews = new Step({
   }),
   execute: async ({ context }) => {
     const { reviews } = context.getStepResult(parseReviews);
-
-    const aggregated = {
-      tone: [] as (string | null)[],
-      pronoun: [] as (string | null)[],
-      length: [] as (string | null)[],
-      paragraph: [] as (string | null)[],
-      phrases: [] as (string | null)[],
-      signature: [] as (string | null)[],
-      emojis: [] as (string[] | null)[],
-      cta: [] as (string | null)[],
+    const aggregated: any = {
+      tone: [], pronoun: [], paragraph: [], phrases: [], signature: [], emojis: [], cta: [],
     };
 
     for (let i = 0; i < reviews.length; i += 25) {
       const batch = reviews.slice(i, i + 25);
-      const prompt = `以下の口コミ ${batch.length} 件から、このブランドの返信文の特徴を抽出してください。\n\n${JSON.stringify(batch, null, 2)}`;
+      const prompt = `以下のレビュー返信文から、返信文に共通して見られる口調や構成などの特徴を抽出してください。\n\n${JSON.stringify(batch, null, 2)}`;
       try {
-        // Agent 呼び出しとパースをそれぞれキャッチ
         const response = await extractionAgent.generate(
           [{ role: 'user', content: prompt }],
-          {
-            output: extractionSchema,
-          }
+          { output: extractionSchema }
         );
         const data = response.object;
-
         aggregated.tone.push(data.tone);
         aggregated.pronoun.push(data.pronoun);
-        aggregated.length.push(data.length);
         aggregated.paragraph.push(data.paragraph);
         aggregated.phrases.push(data.phrases);
         aggregated.signature.push(data.signature);
-        aggregated.emojis.push(data.emojis);
         aggregated.cta.push(data.cta);
-      } catch (agentError) {
-        console.log(`Error processing batch ${i / 25}:`, agentError);
-        continue;
+      } catch (e) {
+        console.warn(`Batch ${i/25} error:`, e);
       }
     }
 
@@ -220,63 +254,103 @@ const summarizerAgent = new Agent({
   name: 'Reply Feature Summarizer',
   model: llm,
   instructions: `
-あなたはスタイルガイド生成エキスパートです。
+あなたはレビュー返信スタイルガイド作成のエキスパートです。
 
-背景:
-- 前段階で抽出された複数の特徴の配列があります。
+レビュー返信を通じてブランドトーンを表現するためのスタイルガイドを作成してください。
+複数の返信担当者が定義したスタイルガイドが提供されます。それらを統合・整理して完全なスタイルガイドを作成してください。
 
-役割:
-- 各フィールドの配列から、最も共通し頻出する要素を優先的に抽出してください。
-- 抽出が困難な場合や要素が見られない場合は null を返してください。
+項目:
+- 口調・敬語レベル
+- 一人称・代名詞
+- 段落構成
+  - 「感謝→ポジ要素→謝辞→改善策→再訪招待」など
+- 頻出フレーズ
+  - 「ご来店ありがとうございます」「またのご利用を…」など
+- 署名形式
+- CTA
+  - 電話番号・メールへの誘導文など
 
-出力:
-- JSON で、スキーマ: ${extractionSchema}
+制約:
+- 担当者ごとに異なるスタイルを定義している場合は多いものを採用する
+- 重複するスタイルは統合する
+- 誰が読んでも解釈にばらつきがないように具体的なスタイルを定義する
+- 各項目は日本語で返す
 `,
 });
 
 const summarizeAggregates = new Step({
   id: 'summarize-aggregates',
-  description: '配列を単一文字列に要約',
+  description: '配列を単一ガイドに要約',
   outputSchema: extractionSchema,
   execute: async ({ context }) => {
     const { aggregated } = context.getStepResult(processReviews);
-    const prompt = `以下の aggregated 特徴配列から、共通部分を優先して抽出し、単一の簡潔な日本語文字列としてまとめてください。\n\n${JSON.stringify(aggregated, null, 2)}`;
-    const response = await summarizerAgent.generate(
+    const prompt = `以下の抽出結果をもとに、ブランドトーンを表現するスタイルガイドを具体的にまとめてください。\n\n${JSON.stringify(aggregated, null, 2)}`;
+    try {
+      const response = await summarizerAgent.generate(
       [{ role: 'user', content: prompt }],
-      {
-        output: extractionSchema,
-      }
-    );
-
-    console.log('summary', response.object);
-    return response.object;
+      { output: extractionSchema }
+      );
+      console.log('summarizeAggregates', response.object);
+      return response.object;
+    } catch (e) {
+      console.error('summarizeAggregates error', e);
+      throw e;
+    }
   },
 });
 
 /* --------------------------------------------------------------------------
- * 6. JSON ファイル保存 Step
+ * 6. スタイルガイド出力 Step
  * -----------------------------------------------------------------------*/
-const saveGuidelines = new Step({
-  id: 'save-guidelines',
-  description: '要約結果を JSON ファイルに保存',
+const outputStyleGuide = new Step({
+  id: 'output-style-guide',
+  description: '要約結果と統計情報をコンソールログ出力',
+  outputSchema: styleGuideSchema,
   execute: async ({ context }) => {
     const summary = context.getStepResult(summarizeAggregates);
     const stats = context.getStepResult(computeReplyStats);
 
-    const outObject = {
-      reply_stats: stats,
-      reply_guidelines: summary,
+    const labels: Record<string, string> = {
+      tone: '口調・敬語レベル',
+      pronoun: '一人称・代名詞',
+      paragraph: '段落構成',
+      phrases: '頻出フレーズ',
+      signature: '署名形式',
+      cta: 'CTA',
+      frequentlyUsedEmojis: '頻出絵文字',
+      replyLengthConfidenceInterval: '返信文字数',
     };
 
-    try {
-      await fs.mkdir('data/output', { recursive: true });
-      await fs.writeFile('data/output/reply_guidelines.json', JSON.stringify(outObject, null, 2), 'utf-8');
-    } catch (error) {
-      console.error('ファイル保存エラー:', error);
-      throw error;
+    const lines: string[] = [];
+    Object.entries(summary).forEach(([key, value]) => {
+      if (value == null) return;
+      const label = labels[key] || key;
+      if (key === 'phrases' && Array.isArray(value) && value.length) {
+        lines.push(`- ${label}:`);
+        value.forEach(phrase => lines.push(`  - \`${phrase}\``));
+      } else if (Array.isArray(value)) {
+        lines.push(`- ${label}: ${value.join('、')}`);
+      } else if (typeof value === 'string') {
+        lines.push(`- ${label}: ${value}`);
+      }
+    });
+    if (stats.frequentlyUsedEmojis.length) {
+      lines.push(`- ${labels.frequentlyUsedEmojis}: ${stats.frequentlyUsedEmojis.join('、')}`);
+    }
+    const [rMin, rMax] = stats.replyLengthConfidenceInterval;
+    if (!(rMin === 0 && rMax === 0)) {
+      lines.push(`- ${labels.replyLengthConfidenceInterval}: ${Math.round(rMin)}文字〜${Math.round(rMax)}文字`);
+    }
+    // emojiUsageRateが0の場合は`- 絵文字: 使用しない`と表示
+    if (stats.emojiUsageRate === 0) {
+      lines.push(`- 絵文字: 使用しない`);
+    } else {
+      lines.push(`- 絵文字使用頻度: ${stats.emojiUsageRate}% ※ 1回以上絵文字が使用された返信の割合`);
     }
 
-    return { savedPath: 'data/output/reply_guidelines.json' };
+    console.log('=== スタイルガイド ===');
+    lines.forEach(line => console.log(line));
+    return { ...summary, ...stats };
   },
 });
 
@@ -291,7 +365,7 @@ const reviewAutoReplyWorkflow = new Workflow({
   .then(computeReplyStats)
   .then(processReviews)
   .then(summarizeAggregates)
-  .then(saveGuidelines);
+  .then(outputStyleGuide);
 
 reviewAutoReplyWorkflow.commit();
 
