@@ -5,12 +5,12 @@ import { z } from 'zod';
 import Converter from 'csvtojson';
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import { replyGeneratorAgent } from './agents/reply-generator-agent';
+import { replyRefinerAgent } from './agents/reply-refiner-agent';
 
 /* --------------------------------------------------------------------------
  * 1. 共有リソース
  * -----------------------------------------------------------------------*/
-const llm = openai('gpt-4o-mini');
-// const llm = openai('o3-mini');
 
 /** Review レコード */
 const reviewSchema = z.object({
@@ -23,21 +23,6 @@ const reviewSchema = z.object({
   reply: z.string().nullable(),
 });
 type Review = z.infer<typeof reviewSchema>;
-
-const systemPrompt = `お客様の口コミに対する返信文を作成してください。
-口コミの内容や感情を適切に理解し、お客様満足度が向上するような返信文を考慮します。
-返信文には適切な改行を入れてください。
-
-# 禁止事項
-
-- 投稿者、経営者、従業員を含め人名を記載することは禁止
-- 「〜店より」のような署名を記載することは禁止
-
-# Output Format
-
-- 返信文は端的で、読みやすい形式にしてください。
-- 返信は指定の言語で作成してください。
-`;
 
 const userExamplePrompt = `
 言語:
@@ -52,12 +37,6 @@ const userExamplePrompt = `
 
 const assistantPrompt = `
 この度はお越しいただきありがとうございます。お食事を楽しんでいただけたようで大変嬉しく思います。またのご来店を心よりお待ち申し上げております。
-`;
-
-const refineSystemPrompt = `
-口コミの返信文をスタイルガイドに従って改善してください。
-返信対象の口コミ、口コミが寄せられたブランドおよび店舗名を提供するので、必要に応じて使用してください。
-改善後の返信文のみ出力し、余計なテキストや記号は含めないこと。
 `;
 
 /* --------------------------------------------------------------------------
@@ -87,21 +66,6 @@ const parseReviews = new Step({
       throw new Error(`CSVファイルが存在しません: ${csvPath} - ${msg}`);
     }
   },
-});
-
-/* --------------------------------------------------------------------------
- * 3. 返信生成 Agent 設定
- * -----------------------------------------------------------------------*/
-const replyGeneratorAgent = new Agent({
-  name: 'Review Reply Generator',
-  model: llm,
-  instructions: systemPrompt,
-});
-
-const replyRefinerAgent = new Agent({
-  name: 'Review Reply Refiner',
-  model: llm,
-  instructions: refineSystemPrompt,
 });
 
 /* --------------------------------------------------------------------------
