@@ -321,8 +321,8 @@ const generateStyleGuide = new Step({
 /* --------------------------------------------------------------------------
  * 6. Workflow 定義
  * -----------------------------------------------------------------------*/
-const reviewAutoReplyWorkflow = new Workflow({
-  name: 'review-auto-reply-workflow',
+const generateStyleGuideWorkflow = new Workflow({
+  name: 'generate-style-guide-workflow',
   triggerSchema: z.object({ csvPath: z.string() }),
 })
   .step(parseReviews)
@@ -330,6 +330,6 @@ const reviewAutoReplyWorkflow = new Workflow({
   .then(processReviews)
   .then(generateStyleGuide);
 
-reviewAutoReplyWorkflow.commit();
+generateStyleGuideWorkflow.commit();
 
-export { reviewAutoReplyWorkflow };
+export { generateStyleGuideWorkflow };
