@@ -2,6 +2,7 @@
 import fs from 'fs';
 import path from 'path';
 import csvParser from 'csv-parser';
+import pLimit from 'p-limit';
 import { InstructionComplianceMetric } from "../evals/InstructionComplianceMetric";
 import { openai } from '@ai-sdk/openai';
 import { fileURLToPath } from 'url';
@@ -15,9 +16,6 @@ type Guideline = { title: string; instruction: string };
 enum StatKey {
   AVERAGE = 'average',
   STDDEV = 'stddev',
-  MIN = 'min',
-  MAX = 'max',
-  COUNT = 'count'
 }
 
 // ガイドライン定義
@@ -81,47 +79,75 @@ async function readCsv(filePath: string): Promise<any[]> {
   });
 }
 
-async function main() {
-  // OpenAI LLMとメトリックインスタンス
-  const llm = openai('gpt-4o-mini');
-  const metric = new InstructionComplianceMetric(llm);
-
-  // CSVファイルパス
-  const fileName = 'AI返信検証用データ - オリエンタルホテル 京都六条_test.csv';
+async function evaluateFile(fileName: string, llmMetric: InstructionComplianceMetric) {
   const csvPath = path.resolve(__dirname, '../../../../../data/csv', fileName);
   const rows = await readCsv(csvPath);
 
   // スコア集計用オブジェクト
-  const scores: Record<string, number[]> = {};
-  guidelines.forEach((g) => (scores[g.title] = []));
+  const fileScores: Record<string, number[]> = {};
+  guidelines.forEach((g) => (fileScores[g.title] = []));
 
-  // 各行・各ガイドラインで評価
-  for (const row of rows) {
-    const replyText: string = row.reply;
-    for (const g of guidelines) {
-      const result = await metric.measure(g.instruction, replyText);
-      scores[g.title].push(result.score);
-      console.log(`${g.title} - reply: ${replyText.substring(0, 30)}... => ${result.score}`);
-    }
+  // 並列実行（同時最大10）
+  const limit = pLimit(10);
+
+  for (const g of guidelines) {
+    const tasks = rows.map((row) => {
+      const replyText: string = row.reply;
+      return limit(async () => {
+        const result = await llmMetric.measure(g.instruction, replyText);
+        return result.score;
+      });
+    });
+    fileScores[g.title] = await Promise.all(tasks);
   }
 
-  // 統計量計算
+  // 統計量計算（平均と標準偏差）
   const stats: Record<string, Record<StatKey, number>> = {};
-  Object.entries(scores).forEach(([title, arr]) => {
-    const count = arr.length;
-    const sum = arr.reduce((a, b) => a + b, 0);
+  Object.entries(fileScores).forEach(([title, scores]) => {
+    const count = scores.length;
+    const sum = scores.reduce((a, b) => a + b, 0);
     const average = sum / count;
-    const variance = arr.reduce((a, b) => a + Math.pow(b - average, 2), 0) / count;
+    const variance = scores.reduce((a, b) => a + Math.pow(b - average, 2), 0) / count;
     const stddev = Math.sqrt(variance);
-    const min = Math.min(...arr);
-    const max = Math.max(...arr);
-    stats[title] = { average, stddev, min, max, count };
+    stats[title] = { average, stddev };
   });
+  return stats;
+}
 
-  // ファイル出力
-  const outPathJson = path.resolve(__dirname, 'evaluation_stats.json');
-  fs.writeFileSync(outPathJson, JSON.stringify(stats, null, 2), 'utf-8');
-  console.log(`Statistics saved to ${outPathJson}`);
+async function main() {
+  const fileNames = [
+    'AI返信検証用データ - オリエンタルホテル 京都六条_test.csv',
+  ];
+
+  const llm = openai('gpt-4o-mini');
+  const metric = new InstructionComplianceMetric(llm);
+
+  // 全ファイルを評価
+  const allStats: Record<string, Record<string, Record<StatKey, number>>> = {};
+  for (const file of fileNames) {
+    console.log(`Evaluating ${file}...`);
+    allStats[file] = await evaluateFile(file, metric);
+  }
+
+  // CSV出力
+  const headers = ['file', ...guidelines.map((g) => g.title)];
+  const lines = [headers.join(',')];
+
+  for (const file of fileNames) {
+    const stats = allStats[file];
+    const row = [
+      file,
+      ...guidelines.map((g) => {
+        const { average, stddev } = stats[g.title];
+        return `${average.toFixed(3)}±${stddev.toFixed(3)}`;
+      }),
+    ];
+    lines.push(row.join(','));
+  }
+
+  const outPath = path.resolve(__dirname, 'evaluation_stats.csv');
+  fs.writeFileSync(outPath, lines.join('\n'), 'utf-8');
+  console.log(`CSV saved to ${outPath}`);
 }
 
 main().catch((err) => {
