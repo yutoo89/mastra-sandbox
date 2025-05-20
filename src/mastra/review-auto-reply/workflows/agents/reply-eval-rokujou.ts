@@ -1,24 +1,14 @@
-// npx tsx src/mastra/review-auto-reply/workflows/agents/reply-eval.ts
 import fs from 'fs';
 import path from 'path';
 import csvParser from 'csv-parser';
 import pLimit from 'p-limit';
-import { InstructionComplianceMetric } from "../evals/InstructionComplianceMetric";
+import { GuidelinesComplianceMetric, type Guideline, type MultiResult } from '../evals/GuidelinesComplianceMetric';
 import { openai } from '@ai-sdk/openai';
 import { fileURLToPath } from 'url';
 
-// ES モジュール向けに __filename/__dirname を定義
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-type Guideline = { title: string; instruction: string };
-
-enum StatKey {
-  AVERAGE = 'average',
-  STDDEV = 'stddev',
-}
-
-// ガイドライン定義
 const guidelines: Guideline[] = [
   {
     title: 'トーンと敬語',
@@ -59,7 +49,6 @@ const guidelines: Guideline[] = [
   },
 ];
 
-// 評価対象のカラム名リスト
 const targetColumns = [
   'reply_human',
   'reply_ai_gpt_4o_mini',
@@ -67,7 +56,8 @@ const targetColumns = [
   'reply_with_style_guide_step',
 ];
 
-// CSVを読み込むユーティリティ
+type ScoreMap = Record<string, Record<string, number[]>>;
+
 async function readCsv(filePath: string): Promise<Record<string, string>[]> {
   return new Promise((resolve, reject) => {
     const results: Record<string, string>[] = [];
@@ -79,92 +69,90 @@ async function readCsv(filePath: string): Promise<Record<string, string>[]> {
   });
 }
 
-// ファイル内の各カラム・ガイドラインごとに評価し、統計量を算出
-async function evaluateFile(
-  fileName: string,
-  columns: string[],
-  llmMetric: InstructionComplianceMetric
-) {
+async function evaluateFile(fileName: string) {
+  // --- CSV 読み込み & LLM メトリクス初期化 （省略） ---
   const csvPath = path.resolve(__dirname, '../../../../../data/csv', fileName);
   const rows = await readCsv(csvPath);
+  const llm = openai('gpt-4o-mini');
+  const metric = new GuidelinesComplianceMetric(llm);
 
-  // スコア集計用オブジェクト: column -> guidelineTitle -> scores[]
-  const fileScores: Record<string, Record<string, number[]>> = {};
-  columns.forEach(col => {
-    fileScores[col] = {};
-    guidelines.forEach(g => {
-      fileScores[col][g.title] = [];
-    });
-  });
+  // --- スコア集計 ---
+  const scores: ScoreMap = {};
+  for (const col of targetColumns) {
+    scores[col] = {};
+    guidelines.forEach(g => { scores[col][g.title] = []; });
 
-  // 並列実行（同時最大10）
-  const limit = pLimit(10);
-
-  // カラム x ガイドライン で評価タスクを実行
-  for (const col of columns) {
-    for (const g of guidelines) {
-      const tasks = rows.map(row => limit(async () => {
+    const limit = pLimit(5);
+    // 進捗を出力
+    let count = 0;
+    await Promise.all(
+      rows.map(row => limit(async () => {
+        count++;
+        console.log(`${count}/${rows.length}`);
         const text = row[col] ?? '';
         try {
-          const result = await llmMetric.measure(g.instruction, text);
-          return result.score;
-        } catch (err) {
-          console.error(`Error evaluating ${fileName} [${col} - ${g.title}]:`, err);
-          // 失敗した場合はスコアを返さずにスキップ
-          return null;
+          const res = await metric.measureAll(guidelines, text);
+          const info = res.info as MultiResult;
+          info.results.forEach(r => {
+            if (scores[col][r.title] && typeof r.score === 'number') {
+              // 0–10 → 0–1 に正規化
+              scores[col][r.title].push(r.score / 10);
+            }
+          });
+        } catch (e) {
+          console.error(`Error evaluating ${col}:`, e);
         }
-      }));
+      }))
+    );
+  }
 
-      const rawScores = await Promise.all(tasks);
-      // null を除外
-      fileScores[col][g.title] = rawScores.filter((s): s is number => s !== null);
+  // --- 平均と標準偏差を計算 ---
+  const stats: Record<string, Record<string, { average: number; stddev: number }>> = {};
+  for (const col of targetColumns) {
+    stats[col] = {};
+    for (const g of guidelines) {
+      const arr = scores[col][g.title];
+      const n = arr.length;
+      const sum = arr.reduce((a, b) => a + b, 0);
+      const avg = n > 0 ? sum / n : NaN;
+      const variance = n > 0
+        ? arr.reduce((a, b) => a + (b - avg) ** 2, 0) / n
+        : NaN;
+      stats[col][g.title] = { average: avg, stddev: Math.sqrt(variance) };
     }
   }
 
-  // 統計量計算（平均と標準偏差）column -> guideline -> {average, stddev}
-  const stats: Record<string, Record<string, Record<StatKey, number>>> = {};
-  Object.entries(fileScores).forEach(([col, byGuideline]) => {
-    stats[col] = {};
-    Object.entries(byGuideline).forEach(([title, scores]) => {
-      const count = scores.length;
-      const sum = scores.reduce((a, b) => a + b, 0);
-      const average = count > 0 ? sum / count : NaN;
-      const variance = count > 0
-        ? scores.reduce((a, b) => a + Math.pow(b - average, 2), 0) / count
-        : NaN;
-      const stddev = Math.sqrt(variance);
-      stats[col][title] = { average, stddev };
-    });
-  });
+  // --- CSV 出力 ---
+  const outCsvPath = path.resolve(__dirname, 'evaluation_stats.csv');
+  const headers = ['targetColumn', ...guidelines.map(g => g.title)];
+  const lines: string[] = [];
 
-  return stats;
+  // ヘッダー行
+  lines.push(headers.join(','));
+
+  // 各 targetColumn ごとの結果行
+  for (const col of targetColumns) {
+    const row = [
+      col,
+      ...guidelines.map(g => {
+        const { average, stddev } = stats[col][g.title];
+        const avgStr = Number.isFinite(average) ? average.toFixed(3) : 'NaN';
+        const sdStr  = Number.isFinite(stddev)  ? stddev.toFixed(3)  : 'NaN';
+        return `${avgStr}±${sdStr}`;
+      }),
+    ];
+    lines.push(row.join(','));
+  }
+
+  fs.writeFileSync(outCsvPath, lines.join('\n'), 'utf-8');
 }
 
 async function main() {
-  const fileName = 'オリエンタルホテル京都六条.csv';
-
-  const llm = openai('gpt-4o-mini');
-  const metric = new InstructionComplianceMetric(llm);
-
-  console.log(`Evaluating ${fileName}...`);
-  const allStats = await evaluateFile(fileName, targetColumns, metric);
-
-  // CSV出力: column, guideline, average, stddev
-  const headers = ['column', 'guideline', 'average', 'stddev'];
-  const lines = [headers.join(',')];
-
-  Object.entries(allStats).forEach(([col, byGuideline]) => {
-    Object.entries(byGuideline).forEach(([title, { average, stddev }]) => {
-      lines.push([col, title, average.toFixed(3), stddev.toFixed(3)].join(','));
-    });
-  });
-
-  const outPath = path.resolve(__dirname, 'evaluation_stats.csv');
-  fs.writeFileSync(outPath, lines.join('\n'), 'utf-8');
-  console.log(`CSV saved to ${outPath}`);
+  try {
+    await evaluateFile('オリエンタルホテル京都六条.csv');
+  } catch (err) {
+    console.error('Fatal error:', err);
+  }
 }
 
-main().catch((err) => {
-  console.error('Error during evaluation:', err);
-  process.exit(1);
-});
+main();
