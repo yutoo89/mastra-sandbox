@@ -22,12 +22,14 @@
     "@mastra/evals": "^0.1.23",
     "@mastra/libsql": "^0.0.4-alpha.4",
     "@mastra/memory": "^0.3.4-alpha.4",
+    "csv-parser": "^3.2.0",
     "csvtojson": "^2.0.10",
     "zod": "^3.24.4"
   },
   "devDependencies": {
     "@types/node": "^22.15.18",
     "mastra": "^0.6.3-alpha.6",
+    "tsx": "^4.19.4",
     "typescript": "^5.8.3",
     "vitest": "^3.1.3"
   }
