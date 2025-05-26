@@ -1,3 +1,5 @@
+// 実行方法
+// npx tsx src/mastra/review-auto-reply/workflows/agents/reply-eval-rokujou-sample.ts
 import fs from 'fs';
 import path from 'path';
 import csvParser from 'csv-parser';
