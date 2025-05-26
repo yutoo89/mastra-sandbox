@@ -1,4 +1,5 @@
 // npx tsx src/mastra/review-auto-reply/workflows/agents/reply-eval.ts
+// ガイドラインの各項目ごとに評価するので遅い
 import fs from 'fs';
 import path from 'path';
 import csvParser from 'csv-parser';
