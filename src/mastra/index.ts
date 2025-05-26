@@ -10,6 +10,7 @@ import {
   generateOgataStyleGuideWorkflow,
   generateOgataStyleGuideSchemalessWorkflow,
   generateOgataStyleGuideOptimizedWorkflow,
+  generateOgataStyleGuideTwoStepWorkflow,
   replyGeneratorAgent,
   replyRefinerAgent
 } from './review-auto-reply/workflows';
@@ -22,7 +23,8 @@ export const mastra = new Mastra({
     generateReviewReplyWorkflow,
     generateOgataStyleGuideWorkflow,
     generateOgataStyleGuideSchemalessWorkflow,
-    generateOgataStyleGuideOptimizedWorkflow
+    generateOgataStyleGuideOptimizedWorkflow,
+    generateOgataStyleGuideTwoStepWorkflow
   },
   agents: { weatherAgent, replyGeneratorAgent, replyRefinerAgent },
   storage: new LibSQLStore({
