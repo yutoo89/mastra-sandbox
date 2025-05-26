@@ -1,11 +1,6 @@
 name: Mastra Evals Tests
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
-  # 手動実行も可能にする
   workflow_dispatch:
 
 jobs:
