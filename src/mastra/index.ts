@@ -11,6 +11,7 @@ import {
   replyRefinerAgent
 } from './review-auto-reply/workflows';
 
+
 export const mastra = new Mastra({
   workflows: {
     weatherWorkflow,
@@ -20,7 +21,7 @@ export const mastra = new Mastra({
   agents: { weatherAgent, replyGeneratorAgent, replyRefinerAgent },
   storage: new LibSQLStore({
     // stores telemetry, evals, ... into memory storage, if it needs to persist, change to file:../mastra.db
-    url: ":memory:",
+    url: "file:./mastra.db",
   }),
   logger: createLogger({
     name: 'Mastra',
