@@ -1,3 +1,6 @@
+// CIで実行し、スコアが一定以上であることを確認する例
+// このままだとAPI callでタイムアウト（vitestデフォルト5秒を超過）するのでtestTimeoutを延長する設定が必要
+// 
 import { describe, it, expect } from 'vitest';
 import { evaluate } from "@mastra/evals";
 import { ToneConsistencyMetric } from "@mastra/evals/nlp";
@@ -63,4 +66,4 @@ describe('口コミ返信改善エージェントのテスト', () => {
     const lineBreaks = (response.text.match(/\n/g) || []).length;
     expect(lineBreaks).toBeGreaterThanOrEqual(0);
   });
-}); 
+});
