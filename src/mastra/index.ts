@@ -7,6 +7,9 @@ import { weatherAgent } from './agents';
 import {
   generateStyleGuideWorkflow,
   generateReviewReplyWorkflow,
+  generateOgataStyleGuideWorkflow,
+  generateOgataStyleGuideSchemalessWorkflow,
+  generateOgataStyleGuideOptimizedWorkflow,
   replyGeneratorAgent,
   replyRefinerAgent
 } from './review-auto-reply/workflows';
@@ -16,7 +19,10 @@ export const mastra = new Mastra({
   workflows: {
     weatherWorkflow,
     generateStyleGuideWorkflow,
-    generateReviewReplyWorkflow
+    generateReviewReplyWorkflow,
+    generateOgataStyleGuideWorkflow,
+    generateOgataStyleGuideSchemalessWorkflow,
+    generateOgataStyleGuideOptimizedWorkflow
   },
   agents: { weatherAgent, replyGeneratorAgent, replyRefinerAgent },
   storage: new LibSQLStore({
